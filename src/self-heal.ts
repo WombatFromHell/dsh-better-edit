@@ -26,6 +26,26 @@ export interface SelfHealOptions {
   healMinIntervalMs?: number;
 }
 
+/**
+ * Drop whatever currently holds `name` on the agent's own scope layer, so a
+ * re-registration of this plugin's definition succeeds. Used by the watcher
+ * (#43) and by install when a peer plugin claimed the name first.
+ */
+export function reclaimToolEntry(toolsSvc: unknown, agent: unknown, name: string): void {
+  // SAFETY: toolsSvc is the DSH tools service — shape is `layers.scoped: Map<agent, {tools}>`
+  // per cordis internals; narrow at the boundary.
+  const data = (
+    toolsSvc as unknown as {
+      layers?: { scoped?: Map<unknown, { tools?: { data?: Map<string, unknown> } }> };
+    }
+  )?.layers?.scoped?.get?.(agent)?.tools?.data;
+  try {
+    data?.delete?.(name);
+  } catch {
+    // ignore — best-effort delete of the intruding entry
+  }
+}
+
 export function createSelfHealWatcher(options: SelfHealOptions): () => void {
   const {
     agentId,
@@ -89,19 +109,8 @@ export function createSelfHealWatcher(options: SelfHealOptions): () => void {
       const restoreCount = healCount;
       queueMicrotask(() => {
         try {
-          // SAFETY: re-read layer inside microtask — same shape as above
-          const currentLayer = (
-            toolsSvc as unknown as { layers?: { scoped?: Map<unknown, { tools?: unknown }> } }
-          )?.layers?.scoped?.get?.(agent)?.tools as
-            | { get?: (name: string) => unknown; data?: Map<string, unknown> }
-            | undefined;
-          if (!currentLayer) return;
           const restoreTool = (name: string, def: unknown, toolLabel: string): boolean => {
-            try {
-              (currentLayer as { data?: Map<string, unknown> })?.data?.delete?.(name);
-            } catch {
-              // ignore — best-effort delete of intruding entry
-            }
+            reclaimToolEntry(toolsSvc, agent, name);
             try {
               agentCtx.tools.register(def);
             } catch (e) {

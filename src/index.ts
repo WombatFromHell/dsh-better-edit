@@ -2,11 +2,15 @@
  * dsh-better-edit — hash-anchored read/edit/undo_last_edit for
  * DeepSeek Harness, a dsh port of pi-hashline-edit-lsz.
  *
- * Cordis host-plane plugin (mounted by the bundle's cordis.patch.yml). On
- * `agent/created` it registers the hashline tools and prompt sections on
- * the AGENT's own scope layer, so they shadow the preset's built-in `read` /
- * `edit` for that agent (nearest layer wins in dsh's tool registry) and unwind
- * automatically when the agent is disposed. The built-in `write` stays in
+ * Cordis host-plane plugin (mounted by the bundle's cordis.patch.yml). It
+ * registers the hashline tools and prompt sections on the AGENT's own scope
+ * layer, so they shadow the preset's built-in `read` / `edit` for that agent
+ * (nearest layer wins in dsh's tool registry) and unwind automatically when the
+ * agent is disposed. The install runs from the `agent/created` listener, which
+ * the harness emits after the agent scope is composed. A peer plugin may claim a
+ * contested name first (dsh-sol-pi fuses `edit`); install takes the name back and
+ * re-registers, so ownership does not depend on bundle or listener order, and the
+ * other tools still install. The built-in `write` stays in
  * place; scoped pre/post listeners reject copied same-line served anchors
  * before dispatch and append a fresh hashline preview after successful writes.
  *
@@ -25,7 +29,7 @@ import { buildEditTool } from "./tool-edit.js";
 import { buildStrReplaceEditorTool } from "./tool-str-replace-editor.js";
 import { registerUndoTool } from "./tool-undo.js";
 import { registerWriteHook } from "./write-hook.js";
-import { createSelfHealWatcher } from "./self-heal.js";
+import { createSelfHealWatcher, reclaimToolEntry } from "./self-heal.js";
 import { initHasher } from "./hashline/hash-assign.js";
 import {
   composeSections,
@@ -128,53 +132,87 @@ async function resolveAgentSections(rootCtx: Context, agent: Agent): Promise<Sec
 }
 
 function installAgentTools(rootCtx: Context, agent: Agent): void {
-  agent.ctx.effect(async () => {
-    // `fs` is host-plane: use the plugin's own context (covered by
-    // inject) rather than the agent's scoped one, whose fiber chain does
-    // not declare it. The session's live directory still reaches the bridge
-    // per call via `execCwd` (the `workingDirectory` service, falling back to
-    // `exec.agent.session.header.cwd`).
-    const io = ctxFsIO(rootCtx.fs as FileSystem, rootCtx);
-    const disposers: Array<() => void> = [];
-    const sandbox = new FsSandboxController(rootCtx);
-    // Keep owned definitions by reference for self-heal identity check
-    const hashReadDef = buildReadTool(io);
-    disposers.push(agent.ctx.tools.register(hashReadDef));
-    const hashEditDef = buildEditTool(io, sandbox);
-    disposers.push(agent.ctx.tools.register(hashEditDef));
-    // Governed shadow of the preset's built-in str_replace_editor
-    // (ADR-0015): identical contract, encoding-governed mutations.
-    const hashStrReplaceDef = buildStrReplaceEditorTool(io, sandbox);
-    disposers.push(agent.ctx.tools.register(hashStrReplaceDef));
-    disposers.push(registerUndoTool(rootCtx, agent.ctx, io, sandbox));
-    disposers.push(registerWriteHook(rootCtx, agent.ctx, io));
+  // Registrations run synchronously inside the `agent/created` listener
+  // (`AgentsService.announce` awaits a serial emit; the agent scope is already
+  // composed by then). An `agent.ctx.effect(async …)` body starts only after the
+  // event settles, which deferred every registration past every peer plugin and
+  // left the agent-layer names to whoever registered first. Everything below
+  // subscribes on `agent.ctx`, so agent-scope disposal is the cleanup; no manual
+  // disposers.
+  const io = ctxFsIO(rootCtx.fs as FileSystem, rootCtx);
+  const sandbox = new FsSandboxController(rootCtx);
+  // Keep owned definitions by reference for self-heal identity check
+  const hashReadDef = buildReadTool(io);
+  const hashEditDef = buildEditTool(io, sandbox);
+  // Governed shadow of the preset's built-in str_replace_editor
+  // (ADR-0015): identical contract, encoding-governed mutations.
+  const hashStrReplaceDef = buildStrReplaceEditorTool(io, sandbox);
 
-    const toolsSvc = rootCtx.get("tools");
-    disposers.push(
-      createSelfHealWatcher({
-        agentId: agent.id,
-        rootCtx,
-        agent,
-        agentCtx: agent.ctx,
-        toolsSvc,
-        hashReadDef,
-        hashEditDef,
-        hashStrReplaceDef,
-      }),
-    );
-    // Shadow the preset's built-in tool guidance with the hashline
-    // contract. Same section names on the agent's own layer win over the
-    // preset's; text and order come from the per-preset resolution, with the
-    // harness's canonical tool slot as the default order.
-    const sections = await resolveAgentSections(rootCtx, agent);
-    for (const section of sections) {
-      disposers.push(agent.ctx.systemPrompt.section(section));
+  // A duplicate name in the SAME scope layer throws (`tool "X" is already
+  // registered in this scope`, dsh-tools NamedEntries). A peer plugin may claim
+  // a contested name first — dsh-sol-pi's then_run fusion registers from its own
+  // `["agents"]` inject pass, which can resolve before this plugin's pass or
+  // listener — so the name is taken back and re-registered: this plugin owns
+  // `read`/`edit`/`str_replace_editor`/`undo_last_edit`. An uncaught throw would
+  // reject the install and silently drop everything after it, so each step stays
+  // isolated; the watcher below keeps the names through later layer changes.
+  const toolsSvc = rootCtx.get("tools");
+  const own = (label: string, register: () => void, takeName?: string): void => {
+    try {
+      register();
+      return;
+    } catch (error) {
+      if (takeName !== undefined) {
+        reclaimToolEntry(toolsSvc, agent, takeName);
+        try {
+          register();
+          return;
+        } catch {
+          // fall through to the warn below
+        }
+      }
+      rootCtx.logger.warn(
+        `dsh-better-edit: ${label} not registered for agent ${agent.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
     }
+  };
 
-    return () => {
-      for (const dispose of disposers) dispose();
-    };
+  own("read", () => agent.ctx.tools.register(hashReadDef), "read");
+  own("edit", () => agent.ctx.tools.register(hashEditDef), "edit");
+  own(
+    "str_replace_editor",
+    () => agent.ctx.tools.register(hashStrReplaceDef),
+    "str_replace_editor",
+  );
+  own("undo_last_edit", () => registerUndoTool(rootCtx, agent.ctx, io, sandbox), "undo_last_edit");
+  own("write hook", () => registerWriteHook(rootCtx, agent.ctx, io));
+
+  // ponytail: the watcher's `tools/change` listener is agent-scoped, so scope
+  // disposal stops it; the returned stop function is unused by design.
+  createSelfHealWatcher({
+    agentId: agent.id,
+    rootCtx,
+    agent,
+    agentCtx: agent.ctx,
+    toolsSvc,
+    hashReadDef,
+    hashEditDef,
+    hashStrReplaceDef,
   });
+
+  // Guidance needs preset composition and file reads, so it lands after the
+  // tools. Same rule as the tools: a duplicate section name in this layer throws.
+  void resolveAgentSections(rootCtx, agent)
+    .then((sections) => {
+      for (const section of sections) {
+        own(`guidance section ${section.name}`, () => agent.ctx.systemPrompt.section(section));
+      }
+    })
+    .catch((error) => {
+      rootCtx.logger.warn(
+        `dsh-better-edit: guidance install failed for agent ${agent.id}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
 }
 
 /** Mount the bundle: initialize the store, then install tools per agent. */
@@ -212,13 +250,7 @@ export function apply(rootCtx: Context): void {
   });
 
   const registered = new WeakSet<Agent>();
-  rootCtx.on("agent/created", ({ agent }) => {
-    // throttled central janitor on session-start (inside same handler to avoid extra listener)
-    onSessionStart().catch((e) =>
-      rootCtx.logger.warn(
-        `dsh-better-edit: central janitor failed: ${e instanceof Error ? e.message : String(e)}`,
-      ),
-    );
+  const installOnce = (agent: Agent): void => {
     if (registered.has(agent)) return;
     registered.add(agent);
     try {
@@ -228,6 +260,16 @@ export function apply(rootCtx: Context): void {
         `dsh-better-edit: failed to install tools for agent ${agent.id}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  };
+
+  rootCtx.on("agent/created", ({ agent }) => {
+    // throttled central janitor on session-start (inside same handler to avoid extra listener)
+    onSessionStart().catch((e) =>
+      rootCtx.logger.warn(
+        `dsh-better-edit: central janitor failed: ${e instanceof Error ? e.message : String(e)}`,
+      ),
+    );
+    installOnce(agent);
   });
 }
 

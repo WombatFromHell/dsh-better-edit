@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { createSelfHealWatcher } from "../../src/self-heal.js";
+import { createSelfHealWatcher, reclaimToolEntry } from "../../src/self-heal.js";
 
 function flushMicrotasks(): Promise<void> {
   return new Promise((resolve) => queueMicrotask(() => queueMicrotask(resolve)));
@@ -262,5 +262,14 @@ describe("self-heal watcher", () => {
     expect(toolMap.get("edit")).toBe(fakeDef);
     expect(warnCalls.length).toBe(0);
     expect(editDef).toBeDefined();
+  });
+
+  it("reclaimToolEntry drops a peer plugin's entry so re-registration lands ours", () => {
+    const { toolMap, toolsSvc, agent, editDef, fakeDef, agentCtx } = createMocks();
+    toolMap.set("edit", fakeDef);
+    reclaimToolEntry(toolsSvc, agent, "edit");
+    expect(toolMap.has("edit")).toBe(false);
+    agentCtx.tools.register(editDef);
+    expect(toolMap.get("edit")).toBe(editDef);
   });
 });

@@ -19,6 +19,7 @@ All notable changes to this project will be documented in this file.
 
 * **edit:** reject an unnamed file at admission instead of guessing it from anchors (#117) (#120)
 * **domain-errors:** route `W_NOOP` to `MODEL` so the second identical no-op carries "Resend will reject" to the model that would resend, not a human-only `[USER]` notice — warnings are now guarded by an audience oracle that refuses model-directed text on a `USER` warning (ADR-0014 amendment) (#122)
+* **install:** take contested agent-layer tool names back and isolate each install step, so a peer plugin that claimed `edit` no longer drops `str_replace_editor`, `undo_last_edit`, the `write` hook, and the guidance sections (ADR-0032) (#123)
 
 ## [1.2.3] - 2026-11-16
 
